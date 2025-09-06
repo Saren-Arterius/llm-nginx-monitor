@@ -1,0 +1,3 @@
+log_monitor_config.json
+*.bak
+blacklist.db
