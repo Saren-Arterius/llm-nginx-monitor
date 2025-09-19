@@ -52,6 +52,7 @@ class LogMonitor:
         ipaddress.ip_network('100.64.0.0/10'),
         ipaddress.ip_network('127.0.0.0/8'),
     ]
+    FLOOD_THRESHOLD_BYTES = 10 * 1024  # 10 KB
 
     def __init__(self, log_dir_glob, config_file, db_file, nginx_deny_list, unban_file):
         """Initializes the log monitor, sets up configuration, database, and watches."""
@@ -65,8 +66,6 @@ class LogMonitor:
         self.UNBAN_FILENAME = os.path.basename(self.UNBAN_FILE)
         self.UNBAN_DIR = os.path.dirname(self.UNBAN_FILE)
 
-    
-
         # Initialize instance state
         self.current_public_ip = None
         self.config = {}
@@ -77,6 +76,7 @@ class LogMonitor:
         self.last_llm_check_time = time.time()
         self.last_hourly_export_time = time.time()
         self.ip_regex = re.compile(r'^(\S+)')
+        self.active_blacklist = set()  # New set to store active blacklisted IPs
 
         # Run setup methods
         self._setup_monitoring()
@@ -206,10 +206,10 @@ class LogMonitor:
         except Exception as e:
             logging.error(f"Failed to add {filepath} to config: {e}")
 
-    @staticmethod
-    def _read_new_log_lines(filepath: str, last_cursor: int) -> tuple[list[str], int]:
+    def _read_new_log_lines(self, filepath: str, last_cursor: int) -> tuple[list[str], int]:
         """
         Reads new lines from a log file since the last cursor position.
+        If the file has grown by more than a threshold, skips to the end to avoid getting overwhelmed.
         Handles race conditions by backtracking if a partial line write is detected.
         """
         try:
@@ -220,6 +220,33 @@ class LogMonitor:
 
             if current_size == last_cursor:
                 return [], last_cursor
+
+            # --- FLOOD DETECTION LOGIC ---
+            if (current_size - last_cursor) > self.FLOOD_THRESHOLD_BYTES:
+                logging.warning(
+                    f"Flood detected in {filepath}. Log growth ({current_size - last_cursor} bytes) "
+                    f"exceeds threshold ({self.FLOOD_THRESHOLD_BYTES} bytes). Skipping to near end of file."
+                )
+                with open(filepath, 'rb') as f:
+                    # Seek to a position near the end to find the last full line, avoiding partial reads.
+                    # We'll look in the last 2KB. This is a reasonable chunk size.
+                    seek_pos = max(0, current_size - 2048)
+                    f.seek(seek_pos)
+                    chunk = f.read()  # Read from seek_pos to the end.
+
+                    # Find the last newline character in this chunk.
+                    last_newline_pos_in_chunk = chunk.rfind(b'\n')
+
+                    if last_newline_pos_in_chunk != -1:
+                        # Calculate the absolute position of the new cursor in the file.
+                        new_cursor = seek_pos + last_newline_pos_in_chunk + 1
+                        logging.info(f"Jumping cursor for {filepath} to {new_cursor} to align with last full line.")
+                        return [], new_cursor
+                    else:
+                        # If no newline is found (unlikely for large files), just jump to the end.
+                        logging.warning(f"Could not find a recent newline in {filepath}. Jumping cursor to absolute end: {current_size}")
+                        return [], current_size
+            # --- END OF FLOOD DETECTION LOGIC ---
 
             with open(filepath, 'rb') as f:
                 read_from_cursor = last_cursor
@@ -293,7 +320,6 @@ class LogMonitor:
         client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
         system_prompt = (
             "You are a server network security expert. You will be provided snippet of nginx HTTP log for a public server that accessible by internet, including bots.\n"
-            "The server is under cloudflare tunnel's protection, and IPv6 visitors is mapped to pseudo IPv4 using doc-rfc-6890 test-net block.\n"
             "Give the list of IPs that should be blacklisted for a very long time for blatant vulnerability scanning/triggering in attempt to hack.\n"
             "We have zero tolerance for such activities. However, well-known crawlers are not enemies, try no be nice to them, except when they demostrate explicit malicious behaviours (Bots that are scanning for PHP vulns are no way legit).\n\n"
             "Output the JSON array in format of:\n"
@@ -323,9 +349,14 @@ class LogMonitor:
                 return []
         except json.JSONDecodeError as e:
             logging.error(f"Failed to decode JSON from LLM: {e}\nResponse: {response_content}")
+            return None
         except Exception as e:
-            logging.error(f"An unexpected error occurred while querying LLM: {e}")
-        return None
+            if "429" in str(e):
+                logging.warning(f"LLM rate limit (429) hit. Sleeping for 60 seconds.")
+                time.sleep(60)
+            else:
+                logging.error(f"An unexpected error occurred while querying LLM: {e}")
+            return None
 
     def _update_database(self, items_to_blacklist: list, logs_by_ip: dict) -> bool:
         """Updates the blacklist database. Returns True if any change was made."""
@@ -349,7 +380,6 @@ class LogMonitor:
             ip_evidence = logs_by_ip.get(ip)
             related_logs = "\n".join(ip_evidence['logs']) if ip_evidence else None
             related_sections = ",".join(sorted(list(ip_evidence['sections']))) if ip_evidence else None
-
             try:
                 cursor.execute(
                     "INSERT OR REPLACE INTO blacklist (ip, reason_tldr, confidence, timestamp, logs, sections) VALUES (?, ?, ?, ?, ?, ?)",
@@ -357,6 +387,7 @@ class LogMonitor:
                 )
                 if cursor.rowcount > 0:
                     changes_made = True
+                    self.active_blacklist.add(ip)  # Add to active blacklist set
                     logging.info(f"ADD/UPDATE IP: {ip} | Reason: {item['reason_tldr']} | Confidence: {item['confidence']:.2f}")
             except (sqlite3.Error, ValueError) as e:
                 logging.error(f"DB/Type error for IP {ip}: {e}")
@@ -382,6 +413,7 @@ class LogMonitor:
                     cursor.execute("DELETE FROM blacklist WHERE ip = ?", (ip,))
                     if cursor.rowcount > 0:
                         changes_made += 1
+                        self.active_blacklist.discard(ip) # Remove from active blacklist set
                         logging.info(f"Removed IP {ip} from the blacklist.")
                     else:
                         logging.warning(f"IP {ip} from unban file was not found.")
@@ -403,6 +435,39 @@ class LogMonitor:
         except Exception as e:
             logging.error(f"An error occurred processing unban requests: {e}")
 
+    def _unban_class_e_ips(self):
+        """Removes all Class E (240.0.0.0-255.255.255.255) IPs from the database."""
+        logging.info("Checking for and unbanning Class E IPs (240.0.0.0/4).")
+        class_e_network = ipaddress.ip_network('240.0.0.0/4')
+        cursor = self.db_conn.cursor()
+        cursor.execute("SELECT ip FROM blacklist")
+        all_banned_ips = cursor.fetchall()
+        ips_to_unban = []
+        for (ip_str,) in all_banned_ips:
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                if ip in class_e_network:
+                    ips_to_unban.append(ip_str)
+            except ValueError:
+                logging.warning(f"Invalid IP address found in DB: {ip_str}")
+
+        if ips_to_unban:
+            logging.info(f"Found {len(ips_to_unban)} Class E IPs to unban.")
+            placeholders = ','.join('?' for _ in ips_to_unban)
+            cursor.execute(f"DELETE FROM blacklist WHERE ip IN ({placeholders})", ips_to_unban)
+            changes_made = cursor.rowcount
+            self.db_conn.commit()
+            if changes_made > 0:
+                for ip in ips_to_unban:
+                    self.active_blacklist.discard(ip) # Remove from active blacklist set
+                logging.info(f"Successfully unbanned {changes_made} Class E IP(s) from the database.")
+                self._check_and_update_deny_list()
+            else:
+                logging.info("No Class E IPs were found in the database to unban.")
+        else:
+            logging.info("No Class E IPs found in the database.")
+
+
     def _export_nginx_deny_list(self):
         """Exports active blacklisted IPs to an Nginx 'deny' file."""
         try:
@@ -412,12 +477,15 @@ class LogMonitor:
             active_bans = []
             current_time = int(time.time())
 
+            self.active_blacklist.clear() # Clear and rebuild active blacklist
             for ip, reason, ts, ban_hours in all_potential_bans:
                 if ban_hours is None or ban_hours < 0:
                     active_bans.append((ip, reason, ts, ban_hours))
+                    self.active_blacklist.add(ip)
                     continue
                 if isinstance(ban_hours, (int, float)) and ban_hours > 0 and current_time < (ts + ban_hours * 3600):
                     active_bans.append((ip, reason, ts, ban_hours))
+                    self.active_blacklist.add(ip)
 
             with open(self.NGINX_DENY_LIST, 'w') as f:
                 f.write(f"# Auto-generated on {time.ctime()}\n# Active Bans: {len(active_bans)}\n\n")
@@ -484,9 +552,9 @@ class LogMonitor:
         self._initialize_config()
         self._initialize_db()
         self._initialize_unban_file()
+        self._unban_class_e_ips() # Call the new unban function at startup
         logging.info("Performing initial deny list generation and check.")
-        self._check_and_update_deny_list()
-
+        self._check_and_update_deny_list() # This will populate self.active_blacklist
         try:
             self.inotify = INotify()
             watch_flags = flags.CREATE | flags.MOVED_TO | flags.MODIFY
@@ -519,30 +587,53 @@ class LogMonitor:
         """Reads new lines from logs and adds them to the queue."""
         had_new_logs = False
         for filepath, file_conf in list(self.config.get("files", {}).items()):
-            if ".error" in os.path.basename(filepath):
+            if self._process_log_file(filepath, file_conf):
+                had_new_logs = True
+        return had_new_logs
+
+    def _process_log_file(self, filepath: str, file_conf: dict) -> bool:
+        """Helper to process a single log file."""
+        if ".error" in os.path.basename(filepath):
+            return False
+
+        current_cursor = self.pending_cursor_updates.get(filepath, file_conf["cursor"])
+        new_lines, new_cursor = self._read_new_log_lines(filepath, current_cursor)
+
+        if new_cursor == current_cursor:
+            return False
+
+        self.pending_cursor_updates[filepath] = new_cursor
+
+        if new_cursor < current_cursor:
+            logging.info(f"Log file {filepath} was truncated. Resetting cursor.")
+            return False
+
+        # new_cursor > current_cursor, so we have new lines
+        eligible_lines_count = 0
+        for line in new_lines:
+            # Filter out 444 responses
+            if '" 444 0' in line:
                 continue
 
-            current_cursor = self.pending_cursor_updates.get(filepath, file_conf["cursor"])
-            new_lines, new_cursor = self._read_new_log_lines(filepath, current_cursor)
+            match = self.ip_regex.match(line)
+            if not match:
+                continue
 
-            if new_cursor != current_cursor:
-                self.pending_cursor_updates[filepath] = new_cursor
-                if new_cursor > current_cursor:
-                    had_new_logs = True
-                    public_lines_count = 0
-                    for line in new_lines:
-                        # Filter out 444
-                        if '" 444 0' in line:
-                            continue
-                        match = self.ip_regex.match(line)
-                        if match and not self._is_private_ip(match.group(1)):
-                            self.log_queue.append((filepath, line))
-                            public_lines_count += 1
-                    if public_lines_count > 0:
-                        logging.info(f"Found {len(new_lines)} lines in {filepath}, enqueued {public_lines_count}. Queue: {len(self.log_queue)}")
-                else:
-                    logging.info(f"Log file {filepath} was truncated. Resetting cursor.")
-        return had_new_logs
+            ip = match.group(1)
+            # Filter out private IPs and already blacklisted IPs
+            if self._is_private_ip(ip) or ip in self.active_blacklist:
+                continue
+
+            self.log_queue.append((filepath, line))
+            eligible_lines_count += 1
+
+        if eligible_lines_count > 0:
+            logging.info(
+                f"Found {len(new_lines)} lines in {filepath}, enqueued {eligible_lines_count}. "
+                f"Queue: {len(self.log_queue)}"
+            )
+
+        return True
 
     def _process_log_batch(self) -> bool:
         """Processes a log batch, queries LLM, and updates state."""
@@ -554,11 +645,33 @@ class LogMonitor:
             match = self.ip_regex.match(line)
             if match:
                 ip = match.group(1)
-                server_name = self.config["files"].get(filepath, {}).get("server_name", "unknown")
-                logs_by_ip[ip]['logs'].append(line)
-                logs_by_ip[ip]['sections'].add(server_name)
+                # Double-check against active_blacklist before sending to LLM,
+                # though _poll_log_files should largely handle this
+                if ip not in self.active_blacklist:
+                    server_name = self.config["files"].get(filepath, {}).get("server_name", "unknown")
+                    logs_by_ip[ip]['logs'].append(line)
+                    logs_by_ip[ip]['sections'].add(server_name)
 
-        llm_prompt = self._format_logs_for_llm(batch)
+        # Only send logs for IPs not already blacklisted
+        filtered_batch_for_llm = []
+        for file_path, log_line in batch:
+            match = self.ip_regex.match(log_line)
+            if match and match.group(1) not in self.active_blacklist:
+                filtered_batch_for_llm.append((file_path, log_line))
+
+        if not filtered_batch_for_llm:
+            logging.info("Batch contained only already blacklisted IPs or no eligible IPs. Skipping LLM query.")
+            # Still update cursors for processed lines
+            for path, new_pos in self.pending_cursor_updates.items():
+                if path in self.config["files"]:
+                    self.config["files"][path]["cursor"] = new_pos
+            with open(self.CONFIG_FILE, 'w') as f:
+                json.dump(self.config, f, indent=4)
+            self.pending_cursor_updates.clear()
+            return True
+
+
+        llm_prompt = self._format_logs_for_llm(filtered_batch_for_llm)
         print('=============================\n' + llm_prompt + '\n=============================')
         blacklisted_items = self._query_llm(llm_prompt)
         self._update_current_public_ip()
@@ -599,7 +712,7 @@ class LogMonitor:
 
                 if time.time() - self.last_hourly_export_time >= 3600:
                     logging.info("Performing scheduled 1-hour deny list export and check.")
-                    self._check_and_update_deny_list()
+                    self._check_and_update_deny_list() # This will refresh self.active_blacklist
                     self.last_hourly_export_time = time.time()
         except KeyboardInterrupt:
             logging.info("Shutdown requested.")
