@@ -113,6 +113,15 @@ class SharedBot:
         app.add_handler(MessageHandler(filters.REPLY & ~filters.COMMAND, handle_reply))
         
         logging.info("Shared Telegram bot starting...")
+        
+        async def post_init(application):
+            await application.bot.send_message(
+                chat_id=self.group_id,
+                text="🚀 Nginx Monitor Bot started and monitoring logs.",
+                message_thread_id=TOPIC_ID_BANS_REVIEWS
+            )
+
+        app.post_init = post_init
         app.run_polling(stop_signals=None)
 
 def ban():
