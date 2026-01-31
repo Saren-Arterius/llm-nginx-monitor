@@ -638,8 +638,8 @@ Based on the above, please provide a helpful response to the user.
 
                                 # Send message for every review
                                 prefix = "[Review]" if ban_hours != -1 else "[Ban]"
-                                server_info = f"\nServers: {sections}" if sections else ""
-                                msg = f"{prefix} IP: {ip}\nBan Hours: {ban_hours}\nVerdict: {verdict_text}{server_info}"
+                                server_tag = f" [{sections}]" if sections else ""
+                                msg = f"{prefix}{server_tag} {ip}\nBan Hours: {ban_hours}\nVerdict: {verdict_text}"
                                 self._send_telegram_message(msg, topic_id=TOPIC_ID_BANS_REVIEWS)
                             else:
                                 logging.warning(f"Review for IP {ip} failed. Marking to prevent retry loop.")

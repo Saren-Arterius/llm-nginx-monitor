@@ -435,8 +435,8 @@ class LogMonitor:
                             logging.info(f"ADD/UPDATE IP: {ip} | Reason: {item['reason_tldr']} | Confidence: {item['confidence']:.2f}")
                             
                             # Send message for every ban
-                            server_info = f"\nServers: {related_sections}" if related_sections else ""
-                            msg = f"[Ban] IP: {ip}\nReason: {item['reason_tldr']}\nConfidence: {item['confidence']:.2f}{server_info}"
+                            server_tag = f" [{related_sections}]" if related_sections else ""
+                            msg = f"[Ban]{server_tag} {ip}\nReason: {item['reason_tldr']}\nConfidence: {item['confidence']:.2f}"
                             self._send_telegram_message(msg, topic_id=TOPIC_ID_BANS_REVIEWS)
                     except (sqlite3.Error, ValueError) as e:
                         logging.error(f"DB/Type error for IP {ip}: {e}")
