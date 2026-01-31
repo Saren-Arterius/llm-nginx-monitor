@@ -5,29 +5,37 @@ import time
 import sqlite3
 import subprocess
 import re
+import asyncio
+import threading
+from dotenv import load_dotenv
 from openai import OpenAI
+
+# Load environment variables
+load_dotenv()
 import ipaddress
 import logging
 from collections import defaultdict, deque
 import fnmatch
 
 # --- Configuration Constants ---
-LOG_DIR_GLOB = "/var/log/nginx/saren/wtako.net/*.log"
-CONFIG_FILE = "log_monitor_config.json"
-DB_FILE = "blacklist.db"
-NGINX_DENY_LIST = "/etc/nginx/conf.d/blacklist.conf"
-UNBAN_FILE = "/tmp/nginx-unban-ips.txt"
+# These are now primarily managed by start.py and passed to LogMonitor
+LOG_DIR_GLOB = os.getenv("LOG_DIR_GLOB", "/var/log/nginx/saren/wtako.net/*.log")
+CONFIG_FILE = os.getenv("CONFIG_FILE", "log_monitor_config.json")
+NGINX_DENY_LIST = os.getenv("NGINX_DENY_LIST", "/etc/nginx/conf.d/blacklist.conf")
+UNBAN_FILE = os.getenv("UNBAN_FILE", "/tmp/nginx-unban-ips.txt")
 
+# Telegram Topic IDs
+TOPIC_ID_BANS_REVIEWS = int(os.getenv("TOPIC_ID_BANS_REVIEWS", "3"))
 
 # IMPORTANT: Set your API key as an environment variable for security.
 API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-API_BASE_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = "@preset/wtako-nginx-llm"
+API_BASE_URL = os.getenv("API_BASE_URL", "http://100.64.0.8:8000/v1")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-oss-120b")
 
 # Batching parameters
-MAX_QUEUE_SIZE = 100
-MAX_WAIT_SECONDS = 60
-POLLING_INTERVAL_SECONDS = 5
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))
+MAX_WAIT_SECONDS = int(os.getenv("MAX_WAIT_SECONDS", "60"))
+POLLING_INTERVAL_SECONDS = int(os.getenv("POLLING_INTERVAL_SECONDS", "5"))
 
 # --- Dependencies ---
 # This script requires the inotify_simple library.
@@ -54,12 +62,11 @@ class LogMonitor:
     ]
     FLOOD_THRESHOLD_BYTES = 10 * 1024  # 10 KB
 
-    def __init__(self, log_dir_glob, config_file, db_file, nginx_deny_list, unban_file):
+    def __init__(self, log_dir_glob, config_file, nginx_deny_list, unban_file, db_conn=None):
         """Initializes the log monitor, sets up configuration, database, and watches."""
         # --- Configuration ---
         self.LOG_DIR_GLOB = log_dir_glob
         self.CONFIG_FILE = config_file
-        self.DB_FILE = db_file
         self.NGINX_DENY_LIST = nginx_deny_list
         self.UNBAN_FILE = unban_file
         self.LOG_DIR = os.path.dirname(self.LOG_DIR_GLOB)
@@ -69,7 +76,6 @@ class LogMonitor:
         # Initialize instance state
         self.current_public_ip = None
         self.config = {}
-        self.db_conn = None
         self.inotify = None
         self.log_queue = deque()
         self.pending_cursor_updates = {}
@@ -77,6 +83,8 @@ class LogMonitor:
         self.last_hourly_export_time = time.time()
         self.ip_regex = re.compile(r'^(\S+)')
         self.active_blacklist = set()  # New set to store active blacklisted IPs
+        self.loop = asyncio.new_event_loop()
+        self.db_conn = db_conn
 
         # Run setup methods
         self._setup_monitoring()
@@ -150,33 +158,49 @@ class LogMonitor:
         with open(self.CONFIG_FILE, 'w') as f:
             json.dump(self.config, f, indent=4)
 
-    def _initialize_db(self):
-        """Initializes the SQLite database and sets the instance connection."""
-        self.db_conn = sqlite3.connect(self.DB_FILE)
-        cursor = self.db_conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS blacklist (
-                ip TEXT PRIMARY KEY,
-                reason_tldr TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                timestamp INTEGER NOT NULL,
-                logs TEXT,
-                sections TEXT,
-                ban_hours INTEGER,
-                verdict TEXT
-            )
-        ''')
-        # Add new columns if they don't exist
-        for col, col_type in {'logs': 'TEXT', 'sections': 'TEXT', 'ban_hours': 'INTEGER', 'verdict': 'TEXT'}.items():
-            try:
-                cursor.execute(f"ALTER TABLE blacklist ADD COLUMN {col} {col_type}")
-                logging.info(f"Added '{col}' column to blacklist table.")
-            except sqlite3.OperationalError as e:
-                if "duplicate column name" not in str(e):
-                    logging.warning(f"Could not add '{col}' column: {e}")
+    def _get_db_conn(self):
+        """Returns the shared connection."""
+        if not self.db_conn:
+            raise RuntimeError("Database connection not initialized. LogMonitor must be provided with a db_conn.")
+        return self.db_conn
 
-        self.db_conn.commit()
-        logging.info(f"Database initialized at {self.DB_FILE}")
+    def _initialize_db(self):
+        """Initializes the SQLite database and table schema."""
+        try:
+            conn = self._get_db_conn()
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS blacklist (
+                        ip TEXT PRIMARY KEY,
+                        reason_tldr TEXT NOT NULL,
+                        confidence REAL NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        logs TEXT,
+                        sections TEXT,
+                        ban_hours INTEGER,
+                        verdict TEXT
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS memories (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        server_name TEXT,
+                        content TEXT NOT NULL
+                    )
+                ''')
+                # Add new columns if they don't exist
+                for col, col_type in {'logs': 'TEXT', 'sections': 'TEXT', 'ban_hours': 'INTEGER', 'verdict': 'TEXT'}.items():
+                    try:
+                        cursor.execute(f"ALTER TABLE blacklist ADD COLUMN {col} {col_type}")
+                        logging.info(f"Added '{col}' column to blacklist table.")
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column name" not in str(e):
+                            logging.warning(f"Could not add '{col}' column: {e}")
+            logging.info("Database schema verified.")
+        except sqlite3.Error as e:
+            logging.critical(f"Fatal error initializing database: {e}. Exiting.")
+            exit(1)
 
     def _initialize_unban_file(self):
         """Creates the unban IP file if it doesn't exist."""
@@ -299,6 +323,16 @@ class LogMonitor:
             server_name = self.config["files"].get(file_path, {}).get("server_name", "unknown_server")
             logs_by_server[server_name].append(log_line)
 
+        memories_by_server = defaultdict(list)
+        try:
+            with self._get_db_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT server_name, content FROM memories")
+                for s_name, content in cursor.fetchall():
+                    memories_by_server[s_name or "all"].append(content)
+        except sqlite3.Error as e:
+            logging.error(f"Failed to fetch memories: {e}")
+
         prompt_parts = []
         for server_name, lines in logs_by_server.items():
             context = "No context provided."
@@ -308,6 +342,14 @@ class LogMonitor:
                     break
             prompt_parts.append(f"[{server_name}]")
             prompt_parts.append(context)
+
+            # Add memories
+            server_memories = memories_by_server.get("all", []) + memories_by_server.get(server_name, [])
+            if server_memories:
+                prompt_parts.append("--- MEMORIES ---")
+                prompt_parts.extend(server_memories)
+                prompt_parts.append("----------------")
+
             prompt_parts.extend(lines)
         return "\n".join(prompt_parts)
 
@@ -363,65 +405,77 @@ class LogMonitor:
         if not items_to_blacklist:
             return False
 
-        cursor = self.db_conn.cursor()
         changes_made = False
         timestamp = int(time.time())
 
-        for item in items_to_blacklist:
-            if not isinstance(item, dict) or not all(k in item for k in ["ip", "reason_tldr", "confidence"]):
-                logging.warning(f"Skipping malformed item from LLM: {item}")
-                continue
+        try:
+            with self._get_db_conn() as conn:
+                cursor = conn.cursor()
+                for item in items_to_blacklist:
+                    if not isinstance(item, dict) or not all(k in item for k in ["ip", "reason_tldr", "confidence"]):
+                        logging.warning(f"Skipping malformed item from LLM: {item}")
+                        continue
 
-            ip = item.get("ip")
-            if not ip or not isinstance(ip, str) or self._is_private_ip(ip):
-                logging.info(f"Skipping invalid or private IP from LLM: {ip}")
-                continue
+                    ip = item.get("ip")
+                    if not ip or not isinstance(ip, str) or self._is_private_ip(ip):
+                        logging.info(f"Skipping invalid or private IP from LLM: {ip}")
+                        continue
 
-            ip_evidence = logs_by_ip.get(ip)
-            related_logs = "\n".join(ip_evidence['logs']) if ip_evidence else None
-            related_sections = ",".join(sorted(list(ip_evidence['sections']))) if ip_evidence else None
-            try:
-                cursor.execute(
-                    "INSERT OR REPLACE INTO blacklist (ip, reason_tldr, confidence, timestamp, logs, sections) VALUES (?, ?, ?, ?, ?, ?)",
-                    (ip, str(item["reason_tldr"]), float(item["confidence"]), timestamp, related_logs, related_sections)
-                )
-                if cursor.rowcount > 0:
-                    changes_made = True
-                    self.active_blacklist.add(ip)  # Add to active blacklist set
-                    logging.info(f"ADD/UPDATE IP: {ip} | Reason: {item['reason_tldr']} | Confidence: {item['confidence']:.2f}")
-            except (sqlite3.Error, ValueError) as e:
-                logging.error(f"DB/Type error for IP {ip}: {e}")
-
-        if changes_made:
-            self.db_conn.commit()
+                    ip_evidence = logs_by_ip.get(ip)
+                    related_logs = "\n".join(ip_evidence['logs']) if ip_evidence else None
+                    related_sections = ",".join(sorted(list(ip_evidence['sections']))) if ip_evidence else None
+                    try:
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO blacklist (ip, reason_tldr, confidence, timestamp, logs, sections) VALUES (?, ?, ?, ?, ?, ?)",
+                            (ip, str(item["reason_tldr"]), float(item["confidence"]), timestamp, related_logs, related_sections)
+                        )
+                        if cursor.rowcount > 0:
+                            changes_made = True
+                            self.active_blacklist.add(ip)  # Add to active blacklist set
+                            logging.info(f"ADD/UPDATE IP: {ip} | Reason: {item['reason_tldr']} | Confidence: {item['confidence']:.2f}")
+                            
+                            # Send message for every ban
+                            msg = f"[Ban] IP: {ip}\nReason: {item['reason_tldr']}\nConfidence: {item['confidence']:.2f}"
+                            self._send_telegram_message(msg, topic_id=TOPIC_ID_BANS_REVIEWS)
+                    except (sqlite3.Error, ValueError) as e:
+                        logging.error(f"DB/Type error for IP {ip}: {e}")
+        except sqlite3.Error as e:
+            logging.error(f"Could not connect to database to update blacklist: {e}")
+            return False
         return changes_made
 
     def _process_unban_requests(self):
         """Reads IPs from the unban file, removes them from the DB, and reloads Nginx."""
+        ips_to_unban = []
         try:
-            with open(self.UNBAN_FILE, 'r') as f:
-                ips_to_unban = [line.strip() for line in f if line.strip()]
+            if os.path.exists(self.UNBAN_FILE):
+                with open(self.UNBAN_FILE, 'r') as f:
+                    ips_to_unban = [line.strip() for line in f if line.strip()]
             if not ips_to_unban:
                 return
+        except IOError as e:
+            logging.error(f"Could not read unban file {self.UNBAN_FILE}: {e}")
+            return
 
-            logging.info(f"Processing unban request for IPs: {', '.join(ips_to_unban)}")
-            cursor = self.db_conn.cursor()
-            changes_made = 0
-            for ip in ips_to_unban:
-                try:
-                    ipaddress.ip_address(ip)
-                    cursor.execute("DELETE FROM blacklist WHERE ip = ?", (ip,))
-                    if cursor.rowcount > 0:
-                        changes_made += 1
-                        self.active_blacklist.discard(ip) # Remove from active blacklist set
-                        logging.info(f"Removed IP {ip} from the blacklist.")
-                    else:
-                        logging.warning(f"IP {ip} from unban file was not found.")
-                except (ValueError, sqlite3.Error) as e:
-                    logging.warning(f"Skipping invalid or DB error for IP in unban file: {ip}, {e}")
+        logging.info(f"Processing unban request for IPs: {', '.join(ips_to_unban)}")
+        changes_made = 0
+        try:
+            with self._get_db_conn() as conn:
+                cursor = conn.cursor()
+                for ip in ips_to_unban:
+                    try:
+                        ipaddress.ip_address(ip)
+                        cursor.execute("DELETE FROM blacklist WHERE ip = ?", (ip,))
+                        if cursor.rowcount > 0:
+                            changes_made += 1
+                            self.active_blacklist.discard(ip)
+                            logging.info(f"Removed IP {ip} from the blacklist.")
+                        else:
+                            logging.warning(f"IP {ip} from unban file was not found.")
+                    except ValueError:
+                        logging.warning(f"Skipping invalid IP in unban file: {ip}")
 
             if changes_made > 0:
-                self.db_conn.commit()
                 logging.info(f"Successfully unbanned {changes_made} IP(s).")
                 self._check_and_update_deny_list()
             else:
@@ -430,18 +484,25 @@ class LogMonitor:
             with open(self.UNBAN_FILE, 'w') as f:
                 pass
             logging.info(f"Cleared unban file: {self.UNBAN_FILE}")
-        except FileNotFoundError:
-            logging.warning(f"Unban file {self.UNBAN_FILE} not found.")
+        except sqlite3.Error as e:
+            logging.error(f"A database error occurred processing unban requests: {e}")
         except Exception as e:
-            logging.error(f"An error occurred processing unban requests: {e}")
+            logging.error(f"An unexpected error occurred processing unban requests: {e}")
 
     def _unban_class_e_ips(self):
         """Removes all Class E (240.0.0.0-255.255.255.255) IPs from the database."""
         logging.info("Checking for and unbanning Class E IPs (240.0.0.0/4).")
         class_e_network = ipaddress.ip_network('240.0.0.0/4')
-        cursor = self.db_conn.cursor()
-        cursor.execute("SELECT ip FROM blacklist")
-        all_banned_ips = cursor.fetchall()
+        all_banned_ips = []
+        try:
+            with self._get_db_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT ip FROM blacklist")
+                all_banned_ips = cursor.fetchall()
+        except sqlite3.Error as e:
+            logging.error(f"Could not connect to DB to check for Class E IPs: {e}")
+            return
+
         ips_to_unban = []
         for (ip_str,) in all_banned_ips:
             try:
@@ -451,42 +512,53 @@ class LogMonitor:
             except ValueError:
                 logging.warning(f"Invalid IP address found in DB: {ip_str}")
 
-        if ips_to_unban:
-            logging.info(f"Found {len(ips_to_unban)} Class E IPs to unban.")
-            placeholders = ','.join('?' for _ in ips_to_unban)
-            cursor.execute(f"DELETE FROM blacklist WHERE ip IN ({placeholders})", ips_to_unban)
-            changes_made = cursor.rowcount
-            self.db_conn.commit()
+        if not ips_to_unban:
+            logging.info("No Class E IPs found in the database.")
+            return
+
+        logging.info(f"Found {len(ips_to_unban)} Class E IPs to unban.")
+        try:
+            with self._get_db_conn() as conn:
+                cursor = conn.cursor()
+                placeholders = ','.join('?' for _ in ips_to_unban)
+                cursor.execute(f"DELETE FROM blacklist WHERE ip IN ({placeholders})", ips_to_unban)
+                changes_made = cursor.rowcount
+
             if changes_made > 0:
                 for ip in ips_to_unban:
-                    self.active_blacklist.discard(ip) # Remove from active blacklist set
+                    self.active_blacklist.discard(ip)
                 logging.info(f"Successfully unbanned {changes_made} Class E IP(s) from the database.")
                 self._check_and_update_deny_list()
             else:
-                logging.info("No Class E IPs were found in the database to unban.")
-        else:
-            logging.info("No Class E IPs found in the database.")
-
+                logging.info("No Class E IPs were found in the database to unban (race condition?).")
+        except sqlite3.Error as e:
+            logging.error(f"Database error while unbanning Class E IPs: {e}")
 
     def _export_nginx_deny_list(self):
         """Exports active blacklisted IPs to an Nginx 'deny' file."""
+        all_potential_bans = []
         try:
-            cursor = self.db_conn.cursor()
-            cursor.execute("SELECT ip, reason_tldr, timestamp, ban_hours FROM blacklist WHERE confidence >= 0.5 ORDER BY timestamp DESC")
-            all_potential_bans = cursor.fetchall()
-            active_bans = []
-            current_time = int(time.time())
+            with self._get_db_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT ip, reason_tldr, timestamp, ban_hours FROM blacklist WHERE confidence >= 0.5 ORDER BY timestamp DESC")
+                all_potential_bans = cursor.fetchall()
+        except sqlite3.Error as e:
+            logging.error(f"Failed to read from database for Nginx export: {e}")
+            return
 
-            self.active_blacklist.clear() # Clear and rebuild active blacklist
-            for ip, reason, ts, ban_hours in all_potential_bans:
-                if ban_hours is None or ban_hours < 0:
-                    active_bans.append((ip, reason, ts, ban_hours))
-                    self.active_blacklist.add(ip)
-                    continue
-                if isinstance(ban_hours, (int, float)) and ban_hours > 0 and current_time < (ts + ban_hours * 3600):
-                    active_bans.append((ip, reason, ts, ban_hours))
-                    self.active_blacklist.add(ip)
+        active_bans = []
+        current_time = int(time.time())
+        self.active_blacklist.clear()
+        for ip, reason, ts, ban_hours in all_potential_bans:
+            if ban_hours is None or ban_hours < 0:
+                active_bans.append((ip, reason, ts, ban_hours))
+                self.active_blacklist.add(ip)
+                continue
+            if isinstance(ban_hours, (int, float)) and ban_hours > 0 and current_time < (ts + ban_hours * 3600):
+                active_bans.append((ip, reason, ts, ban_hours))
+                self.active_blacklist.add(ip)
 
+        try:
             with open(self.NGINX_DENY_LIST, 'w') as f:
                 f.write(f"# Auto-generated on {time.ctime()}\n# Active Bans: {len(active_bans)}\n\n")
                 f.write("geo $is_denied {\n")
@@ -497,8 +569,8 @@ class LogMonitor:
                     f.write(f"    {ip} 1;  # Added {ts_str}{ban_str}, Reason: {reason}\n")
                 f.write("}\n")
             logging.info(f"Exported {len(active_bans)} active IPs to {self.NGINX_DENY_LIST}.")
-        except Exception as e:
-            logging.error(f"Failed to export Nginx deny list: {e}")
+        except IOError as e:
+            logging.error(f"Failed to write Nginx deny list file: {e}")
 
     @staticmethod
     def _reload_nginx():
@@ -552,9 +624,9 @@ class LogMonitor:
         self._initialize_config()
         self._initialize_db()
         self._initialize_unban_file()
-        self._unban_class_e_ips() # Call the new unban function at startup
+        self._unban_class_e_ips()
         logging.info("Performing initial deny list generation and check.")
-        self._check_and_update_deny_list() # This will populate self.active_blacklist
+        self._check_and_update_deny_list()
         try:
             self.inotify = INotify()
             watch_flags = flags.CREATE | flags.MOVED_TO | flags.MODIFY
@@ -719,23 +791,23 @@ class LogMonitor:
         finally:
             self.close()
 
+    def set_telegram_callback(self, callback):
+        """Sets a callback function for sending Telegram messages."""
+        self.telegram_callback = callback
+
+    def _send_telegram_message(self, text: str, topic_id: int | None = None):
+        """Sends a message via the shared Telegram callback."""
+        if hasattr(self, 'telegram_callback') and self.telegram_callback:
+            self.telegram_callback(text, topic_id)
+        else:
+            logging.warning("Telegram callback not set, message not sent: %s", text)
+
     def close(self):
         """Gracefully closes resources."""
         if self.inotify:
             self.inotify.close()
             logging.info("inotify watch closed.")
-        if self.db_conn:
-            self.db_conn.close()
-            logging.info("Database connection closed.")
         logging.info("Monitor stopped.")
 
 if __name__ == "__main__":
-  
-    monitor = LogMonitor(
-        log_dir_glob=LOG_DIR_GLOB,
-        config_file=CONFIG_FILE,
-        db_file=DB_FILE,
-        nginx_deny_list=NGINX_DENY_LIST,
-        unban_file=UNBAN_FILE
-    )
-    monitor.run()
+    print("This script should be run via start.py")

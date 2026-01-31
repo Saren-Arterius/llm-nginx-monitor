@@ -3,39 +3,44 @@ import glob
 import json
 import time
 import sqlite3
+from collections import defaultdict
 import subprocess
 import logging
-import urllib.request
-import urllib.parse
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from openai import OpenAI
 
+# Load environment variables
+load_dotenv()
+
 # --- Configuration ---
-DB_FILE = "blacklist.db"
-CONFIG_FILE = "log_monitor_config.json"
-LOG_DIR_GLOB = "/var/log/nginx/saren/wtako.net/*.log"
-UNBAN_FILE = "/tmp/nginx-unban-ips.txt"
-REVIEW_INTERVAL_SECONDS = 60
-SUMMARY_INTERVAL_SECONDS = 12 * 60 * 60  # 24 hours
+# These are now primarily managed by start.py and passed to BanReviewer
+# Default values are kept for standalone testing if needed.
+CONFIG_FILE = os.getenv("CONFIG_FILE", "log_monitor_config.json")
+LOG_DIR_GLOB = os.getenv("LOG_DIR_GLOB", "/var/log/nginx/saren/wtako.net/*.log")
+UNBAN_FILE = os.getenv("UNBAN_FILE", "/tmp/nginx-unban-ips.txt")
+REVIEW_INTERVAL_SECONDS = int(os.getenv("REVIEW_INTERVAL_SECONDS", "60"))
+SUMMARY_INTERVAL_SECONDS = int(os.getenv("SUMMARY_INTERVAL_SECONDS", str(12 * 60 * 60)))
 
 # --- API Configuration ---
 API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-API_BASE_URL = "https://openrouter.ai/api/v1"
-LLM_REVIEW_MODEL = "@preset/wtako-nginx-llm"
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID", "")
+API_BASE_URL = os.getenv("API_BASE_URL", "http://100.64.0.8:8000/v1")
+LLM_REVIEW_MODEL = os.getenv("LLM_REVIEW_MODEL", "gpt-oss-120b")
+
+# Telegram Topic IDs
+TOPIC_ID_SUMMARIES = int(os.getenv("TOPIC_ID_SUMMARIES", "5"))
+TOPIC_ID_BANS_REVIEWS = int(os.getenv("TOPIC_ID_BANS_REVIEWS", "3"))
 
 
 class BanReviewer:
 
-    def __init__(self):
+    def __init__(self, db_conn=None):
         """Initializes the BanReviewer instance."""
         self._setup_logging()
         self._validate_api_key()
-        self._validate_telegram_config()
         self.client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+        self.db_conn = db_conn
         self.monitor_config = self._load_monitor_config()
-        self.db_conn = None
         self.last_summary_time = 0
         if not self.monitor_config or "files" not in self.monitor_config:
             logging.critical("Monitor config is invalid or empty. Exiting.")
@@ -50,13 +55,6 @@ class BanReviewer:
         if not API_KEY or "<" in API_KEY:
             logging.critical("OpenRouter API key is not set or is a placeholder. Please set the OPENROUTER_API_KEY environment variable.")
             exit(1)
-
-    def _validate_telegram_config(self):
-        """Checks for Telegram configuration and warns if not found."""
-        if not TELEGRAM_BOT_TOKEN or "<" in TELEGRAM_BOT_TOKEN:
-            logging.warning("TELEGRAM_BOT_TOKEN is not set or is a placeholder. Daily summaries will not be sent.")
-        if not TELEGRAM_GROUP_ID:
-            logging.warning("TELEGRAM_GROUP_ID is not set. Daily summaries will not be sent.")
 
     def _initialize_db_schema(self):
         """Ensures the database has the 'blacklist' and 'summaries' tables with the necessary columns."""
@@ -197,9 +195,25 @@ class BanReviewer:
             for file_conf in self.monitor_config.get("files", {}).values()
         }
 
+        memories_by_server = defaultdict(list)
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT server_name, content FROM memories")
+            for s_name, content in cursor.fetchall():
+                memories_by_server[s_name or "all"].append(content)
+        except sqlite3.Error as e:
+            logging.error(f"Failed to fetch memories in review.py: {e}")
+
         for section_name in section_names:
             context = name_to_context.get(section_name, "Context not found for this section.")
             contexts.append(f"[{section_name}]: {context}")
+
+            # Add memories
+            server_memories = memories_by_server.get("all", []) + memories_by_server.get(section_name, [])
+            if server_memories:
+                contexts.append("--- MEMORIES ---")
+                contexts.extend(server_memories)
+                contexts.append("----------------")
 
         return "\n".join(contexts)
 
@@ -314,10 +328,8 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
 
     def _fetch_data_for_summary(self) -> dict | None:
         """Fetches and aggregates data since the last summary for the report."""
-        conn = None
         try:
-            conn = sqlite3.connect(DB_FILE, timeout=10)
-            cursor = conn.cursor()
+            cursor = self.db_conn.cursor()
 
             # Determine the start timestamp for the summary period
             cursor.execute("SELECT MAX(timestamp) FROM summaries")
@@ -335,11 +347,8 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
                 WHERE verdict IS NOT NULL AND timestamp >= ?
             """, (start_timestamp,))
             rows = cursor.fetchall()
-            conn.close()
         except sqlite3.Error as e:
             logging.error(f"Failed to fetch data for summary: {e}")
-            if conn:
-                conn.close()
             return None
 
         if not rows:
@@ -364,10 +373,8 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
 
     def _fetch_previous_summaries(self) -> list:
         """Fetches recent summaries from the database (last 7 days, max 10)."""
-        conn = None
         try:
-            conn = sqlite3.connect(DB_FILE, timeout=10)
-            cursor = conn.cursor()
+            cursor = self.db_conn.cursor()
             seven_days_ago_ts = int(time.time()) - (7 * 24 * 60 * 60)
             cursor.execute("""
                 SELECT timestamp, summary_text
@@ -378,20 +385,15 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
             """, (seven_days_ago_ts,))
 
             summaries = [f"--- {datetime.fromtimestamp(row[0]).strftime('%Y-%m-%d %H:%M')} 的摘要 ---\n{row[1]}" for row in cursor.fetchall()]
-            conn.close()
             return summaries
         except sqlite3.Error as e:
             logging.error(f"Failed to fetch previous summaries: {e}")
-            if conn:
-                conn.close()
             return []
 
     def _store_summary(self, summary_text: str, incidents_json: str):
         """Stores the newly generated summary and its incidents in the database."""
-        conn = None
         try:
-            conn = sqlite3.connect(DB_FILE, timeout=10)
-            cursor = conn.cursor()
+            cursor = self.db_conn.cursor()
             insert_query = "INSERT INTO summaries (timestamp, summary_text, incidents) VALUES (?, ?, ?)"
             values = (int(time.time()), summary_text, incidents_json)
             try:
@@ -400,21 +402,18 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
                 # One-time migration attempt if the column is missing
                 if "no column named incidents" in str(e).lower():
                     logging.warning("Attempting to add 'incidents' column to 'summaries' table.")
-                    conn.rollback()
+                    self.db_conn.rollback()
                     cursor.execute("ALTER TABLE summaries ADD COLUMN incidents TEXT NOT NULL DEFAULT '[]'")
-                    conn.commit()
+                    self.db_conn.commit()
                     logging.info("Successfully added 'incidents' column. Retrying insert.")
                     cursor.execute(insert_query, values)
                 else:
                     raise  # Re-raise other operational errors
-            conn.commit()
-            conn.close()
+            self.db_conn.commit()
             logging.info("Successfully stored new summary in the database.")
         except sqlite3.Error as e:
             logging.error(f"Failed to store summary in database: {e}")
-            if conn:
-                conn.rollback()
-                conn.close()
+            self.db_conn.rollback()
 
     def _ask_llm_for_summary(self, incidents: list, previous_summaries: list, timeframe: str) -> str | None:
         """Generates a narrative summary of notable incidents using the LLM in Traditional Chinese."""
@@ -459,39 +458,21 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
             logging.error(f"An unexpected error occurred during LLM summary generation: {e}")
             return None
 
-    def _send_telegram_message(self, text: str, reply_to_message_id: int | None = None):
-        """Sends a message to the configured Telegram group."""
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_GROUP_ID or "<" in TELEGRAM_BOT_TOKEN:
-            logging.warning("Telegram credentials missing, skipping message sending.")
-            return
+    def set_telegram_callback(self, callback):
+        """Sets a callback function for sending Telegram messages."""
+        self.telegram_callback = callback
 
-        api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {'chat_id': TELEGRAM_GROUP_ID, 'text': text}
-        if reply_to_message_id:
-            payload['reply_to_message_id'] = reply_to_message_id
-
-        data = urllib.parse.urlencode(payload).encode('utf-8')
-        req = urllib.request.Request(api_url, data=data)
-        try:
-            with urllib.request.urlopen(req, timeout=10) as response:
-                response_body = response.read().decode('utf-8')
-                response_json = json.loads(response_body)
-                if response.status == 200 and response_json.get("ok"):
-                    if reply_to_message_id:
-                        logging.info("Successfully sent Telegram reply.")
-                    else:
-                        logging.info("Successfully sent summary to Telegram.")
-                else:
-                    logging.error(f"Failed to send message to Telegram. Response: {response_body}")
-        except Exception as e:
-            logging.error(f"Error sending message to Telegram: {e}")
+    def _send_telegram_message(self, text: str, topic_id: int | None = None):
+        """Sends a message via the shared Telegram callback."""
+        if hasattr(self, 'telegram_callback') and self.telegram_callback:
+            self.telegram_callback(text, topic_id)
+        else:
+            logging.warning("Telegram callback not set, message not sent: %s", text)
 
     def _fetch_incidents_for_summary_by_timestamp(self, summary_ts: int) -> str | None:
         """Fetches the raw incidents JSON for a summary closest to a given timestamp."""
-        conn = None
         try:
-            conn = sqlite3.connect(DB_FILE, timeout=10)
-            cursor = conn.cursor()
+            cursor = self.db_conn.cursor()
             cursor.execute("""
                 SELECT incidents
                 FROM summaries
@@ -499,12 +480,9 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
                 LIMIT 1
             """, (summary_ts,))
             result = cursor.fetchone()
-            conn.close()
             return result[0] if result else None
         except sqlite3.Error as e:
             logging.error(f"Failed to fetch incidents for summary at ts {summary_ts}: {e}")
-            if conn:
-                conn.close()
             return None
 
     def _ask_llm_for_telegram_reply(self, original_message: str, user_reply: str, incidents_json: str | None) -> str | None:
@@ -563,51 +541,6 @@ Based on the above, please provide a helpful response to the user.
             logging.error(f"An unexpected error occurred during LLM reply generation: {e}")
             return "抱歉，我在處理您的請求時遇到錯誤。"
 
-    def _handle_telegram_replies(self):
-        """Polls for and handles replies to the bot's messages on Telegram."""
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_GROUP_ID or "<" in TELEGRAM_BOT_TOKEN:
-            return
-
-        if not hasattr(self, '_last_update_id'):
-            self._last_update_id = 0
-
-        api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-        params = {'offset': self._last_update_id + 1, 'timeout': 5, 'allowed_updates': json.dumps(['message'])}
-
-        try:
-            req = urllib.request.Request(f"{api_url}?{urllib.parse.urlencode(params)}")
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode('utf-8'))
-
-                if not data.get("ok"):
-                    logging.error(f"Error fetching Telegram updates: {data}")
-                    return
-
-                for update in data.get("result", []):
-                    self._last_update_id = max(self._last_update_id, update['update_id'])
-                    message = update.get('message')
-                    if not (message and str(message.get('chat', {}).get('id')) == TELEGRAM_GROUP_ID and 'reply_to_message' in message and not message.get('from', {}).get('is_bot')):
-                        continue
-
-                    reply_to_msg = message['reply_to_message']
-                    original_text = reply_to_msg.get('text', '')
-                    original_ts = reply_to_msg.get('date')
-                    user_reply = message.get('text', '')
-                    msg_id = message.get('message_id')
-
-                    if original_text and user_reply and msg_id and original_ts:
-                        logging.info(f"Received Telegram reply to process: '{user_reply[:50]}...'")
-                        incidents_json = self._fetch_incidents_for_summary_by_timestamp(original_ts)
-                        llm_response = self._ask_llm_for_telegram_reply(original_text, user_reply, incidents_json)
-                        if llm_response:
-                            self._send_telegram_message(llm_response, reply_to_message_id=msg_id)
-
-        except urllib.error.URLError as e:
-            if "timed out" not in str(e).lower():
-                logging.warning(f"Could not connect to Telegram API for updates: {e}")
-        except Exception as e:
-            logging.error(f"Error processing Telegram updates: {e}", exc_info=True)
-
     def _run_summary_task(self):
         """Orchestrates the creation and sending of the daily summary."""
         logging.info("Starting summary task.")
@@ -656,24 +589,16 @@ Based on the above, please provide a helpful response to the user.
         print('*************************')
         print(full_summary)
         print('*************************')
-        self._send_telegram_message(full_summary)
+        self._send_telegram_message(full_summary, topic_id=TOPIC_ID_SUMMARIES)
 
     def run(self):
         """Main loop to periodically check for reviews and generate summaries."""
         logging.info("Starting Ban Reviewer process.")
 
-        # Open a persistent connection for the bootstrap initialization
-        try:
-            self.db_conn = sqlite3.connect(DB_FILE, timeout=10)
-            self._initialize_db_schema()
-        except sqlite3.Error as e:
-             logging.critical(f"Failed to initialize database schema on startup: {e}")
-             exit(1)
-        finally:
-            if self.db_conn:
-                self.db_conn.close()
-                self.db_conn = None
+        if not self.db_conn:
+            raise RuntimeError("Database connection not initialized. BanReviewer must be provided with a db_conn.")
 
+        self._initialize_db_schema()
         self._run_summary_task()
         self.last_summary_time = time.time()
 
@@ -684,7 +609,6 @@ Based on the above, please provide a helpful response to the user.
                     self.last_summary_time = time.time()
 
                 try:
-                    self.db_conn = sqlite3.connect(DB_FILE, timeout=10)
                     unreviewed_entries = self._fetch_unreviewed_ips()
                     if not unreviewed_entries:
                         logging.info(f"No new entries to review. Waiting for {REVIEW_INTERVAL_SECONDS} seconds.")
@@ -711,6 +635,11 @@ Based on the above, please provide a helpful response to the user.
                                 verdict_text = verdict_result.get("verdict")
                                 self._update_db_with_verdict(ip, ban_hours, verdict_text)
                                 self._process_amendments(ip, verdict_result)
+
+                                # Send message for every review
+                                prefix = "[Review]" if ban_hours != -1 else "[Ban]"
+                                msg = f"{prefix} IP: {ip}\nBan Hours: {ban_hours}\nVerdict: {verdict_text}"
+                                self._send_telegram_message(msg, topic_id=TOPIC_ID_BANS_REVIEWS)
                             else:
                                 logging.warning(f"Review for IP {ip} failed. Marking to prevent retry loop.")
                                 self._update_db_with_verdict(ip, -2, "Review failed due to API or parsing error.")
@@ -721,9 +650,6 @@ Based on the above, please provide a helpful response to the user.
                 except Exception as e:
                     logging.critical(f"An unexpected error occurred during review cycle: {e}", exc_info=True)
                 finally:
-                    if self.db_conn:
-                        self.db_conn.close()
-                        self.db_conn = None
                     time.sleep(REVIEW_INTERVAL_SECONDS)
         except KeyboardInterrupt:
             logging.info("Shutdown requested by user.")
@@ -732,28 +658,4 @@ Based on the above, please provide a helpful response to the user.
 
 
 if __name__ == "__main__":
-    import threading
-
-    reviewer = BanReviewer()
-
-    def telegram_poll_task():
-        """Continuously polls for Telegram replies in a background thread."""
-        while True:
-            try:
-                reviewer._handle_telegram_replies()
-                # The _handle_telegram_replies function uses long polling.
-                # This sleep prevents a tight loop if it returns immediately on error.
-                time.sleep(2)
-            except Exception as e:
-                logging.error(f"Unhandled exception in Telegram polling thread: {e}", exc_info=True)
-                # Wait longer after an unexpected error to avoid spamming.
-                time.sleep(60)
-
-    # Run the Telegram polling in a separate daemon thread so it doesn't block the main review cycle.
-    # The daemon thread will exit automatically when the main program exits.
-    telegram_listener_thread = threading.Thread(target=telegram_poll_task, daemon=True)
-    telegram_listener_thread.start()
-    logging.info("Telegram reply listener started in a background thread.")
-
-    # Start the main review and summary process.
-    reviewer.run()
+    print("This script should be run via start.py")

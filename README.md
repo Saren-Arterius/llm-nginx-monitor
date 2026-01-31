@@ -2,9 +2,11 @@
 
 This project provides a sophisticated, two-stage system for automatically detecting and banning malicious actors by monitoring Nginx access logs. It leverages Large Language Models (LLMs) to analyze log data, make intelligent banning decisions, and provide detailed summaries of security events.
 
-The system is split into two main components:
-1.  **`main.py` (Log Monitor):** Performs real-time log monitoring, sends suspicious log batches to an LLM for initial analysis, and applies immediate bans to identified threats.
-2.  **`review.py` (Ban Reviewer):** Acts as a secondary, more detailed analysis layer. It reviews the automated bans, gathers more historical context, and uses an LLM to determine an appropriate ban duration (e.g., permanent, temporary, or unban/false positive). It can also generate periodic summaries for human review via Telegram.
+The system is orchestrated by `start.py` and consists of two main logic components:
+1.  **`ban.py` (Log Monitor):** Performs real-time log monitoring, sends suspicious log batches to an LLM for initial analysis, and applies immediate bans to identified threats.
+2.  **`review.py` (Ban Reviewer):** Acts as a secondary, more detailed analysis layer. It reviews the automated bans, gathers more historical context, and uses an LLM to determine an appropriate ban duration (e.g., permanent, temporary, or unban/false positive). It also generates periodic summaries for human review.
+
+All components share a single SQLite database connection and a unified Telegram bot interface managed by the entry point script.
 
 ## Features
 
@@ -14,22 +16,27 @@ The system is split into two main components:
 - **Two-Stage Analysis:**
     - **Stage 1 (Detect & Block):** Quickly identifies and blocks active threats.
     - **Stage 2 (Review & Sentence):** Performs a deeper analysis to determine a final verdict and ban duration, reducing false positives.
-- **Contextual Reviews:** The reviewer script gathers historical logs and server context to give the LLM a complete picture before it makes a final decision.
-- **Periodic Summaries:** Generates daily summaries of security incidents, analysis, and trends, and reports them to a Telegram group.
-- **Manual Unban:** A simple text file (`/tmp/nginx-unban-ips.txt`) can be used to manually unban one or more IPs.
-- **Persistent State:** Uses a SQLite database (`blacklist.db`) to track all banned IPs, reasons, verdicts, and ban history.
+- **Contextual Reviews with Memories:** The reviewer script gathers historical logs, server context, and **persistent "memories"** (custom rules or notes per server) to give the LLM a complete picture.
+- **Unified Telegram Integration:**
+    - **Shared Bot Interface:** A single bot instance handles notifications from both the monitor and reviewer.
+    - **Real-time Notifications:** Instant alerts for new bans and review verdicts.
+    - **Interactive Bot:** Manage the system via Telegram commands (unban IPs, manage memories) and reply to summaries for AI-powered insights.
+    - **Topic Support:** Organizes summaries and ban alerts into specific Telegram topics.
+- **Periodic Summaries:** Generates periodic summaries of security incidents, analysis, and trends, and reports them to a Telegram group.
+- **Manual Unban:** A simple text file (`/tmp/nginx-unban-ips.txt`) or Telegram command can be used to manually unban IPs.
+- **Persistent State:** Uses a SQLite database (`blacklist.db`) to track all banned IPs, reasons, verdicts, ban history, and LLM memories.
 
 ## How It Works
 
-1.  **Monitoring (`main.py`):**
+1.  **Monitoring (`ban.py`):**
     - The script continuously monitors Nginx access log files specified in the configuration.
     - New log entries (from public IPs) are collected into a queue.
     - When the queue is full or a timeout is reached, the batch of logs is sent to an LLM for initial analysis.
     - The LLM returns a list of IPs it deems malicious.
     - These IPs are added to the `blacklist.db` with an "unreviewed" status.
 
-2.  **Blocking (`main.py`):**
-    - After the database is updated, `main.py` regenerates `/etc/nginx/conf.d/blacklist.conf`. This file uses Nginx's `geo` module to set a variable (`$is_denied`) to `1` for any IP in the blacklist.
+2.  **Blocking (`ban.py`):**
+    - After the database is updated, `ban.py` regenerates `/etc/nginx/conf.d/blacklist.conf`. This file uses Nginx's `geo` module to set a variable (`$is_denied`) to `1` for any IP in the blacklist.
     - It then triggers `sudo nginx -s reload` to apply the changes.
     - Your Nginx server configuration uses this `$is_denied` variable to return a `444` (Connection Closed Without Response) for any request from a blocked IP.
 
@@ -50,7 +57,8 @@ The system is split into two main components:
 
 ## Components
 
-- **`main.py`**: The real-time log monitor and initial banning agent.
+- **`start.py`**: The main entry point that initializes the shared database connection, Telegram bot, and starts both the monitor and reviewer in separate threads.
+- **`ban.py`**: The real-time log monitor and initial banning agent.
 - **`review.py`**: The ban reviewer, sentencing agent, and report generator.
 - **`nginx-snippets/`**: Example Nginx configuration snippets demonstrating how to use the `$is_denied` variable.
 - **`blacklist.db`**: SQLite database storing state about banned IPs.
@@ -68,33 +76,37 @@ The system is split into two main components:
 
 ### 2. Python Dependencies
 
-Install the required Python libraries.
+Install the required Python libraries. It is highly recommended to use [uv](https://github.com/astral-sh/uv) for faster dependency management.
 
 ```bash
-pip install openai inotify-simple
+# Using uv (recommended)
+uv pip install -r requirements.txt
+
+# Or using standard pip
+pip install -r requirements.txt
 ```
 
-### 3. API and Bot Credentials
+### 3. Configuration (.env)
 
-The scripts require API keys set as environment variables.
+The system uses environment variables for configuration. Copy `example.env` to `.env` and fill in your details.
 
 ```bash
-export OPENROUTER_API_KEY="your_openrouter_api_key_here"
-export TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
-export TELEGRAM_GROUP_ID="your_telegram_group_id"
+cp example.env .env
 ```
 
-**Note:** The LLM models (`@preset/wtako-nginx-llm`) in the scripts appear to be custom presets. You will likely need to replace them with generally available models on OpenRouter.ai (e.g., `mistralai/mistral-7b-instruct` or `openai/gpt-4o`).
+Key configuration options:
+- **API Credentials:** `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_GROUP_ID`.
+- **Telegram Topics:** `TOPIC_ID_SUMMARIES`, `TOPIC_ID_BANS_REVIEWS`.
+- **LLM Settings:** `API_BASE_URL`, `LLM_MODEL`, `LLM_REVIEW_MODEL`.
+- **File Paths:** `LOG_DIR_GLOB`, `NGINX_DENY_LIST`, `DB_FILE`, etc.
 
 ### 4. Configure File Paths
 
-The scripts have path constants defined at the top. Ensure they match your system's layout. The most important ones are:
-- `main.py`: `LOG_DIR_GLOB`, `NGINX_DENY_LIST`, `UNBAN_FILE`.
-- `review.py`: `DB_FILE`, `CONFIG_FILE`, `LOG_DIR_GLOB`.
+Ensure the paths in your `.env` file match your system's layout.
 
 ### 5. Nginx Configuration
 
-You need to configure Nginx to use the `blacklist.conf` file generated by `main.py`.
+You need to configure Nginx to use the `blacklist.conf` file generated by `ban.py`.
 
 1.  **Include the blacklist file** in your main `nginx.conf` within the `http` block.
 
@@ -128,7 +140,7 @@ You need to configure Nginx to use the `blacklist.conf` file generated by `main.
 
 ### 6. Sudo Permissions
 
-The `main.py` script needs passwordless `sudo` permission to reload Nginx. Run `sudo visudo` and add the following line, replacing `<user>` with the user that will run the script.
+The `ban.py` script needs passwordless `sudo` permission to reload Nginx. Run `sudo visudo` and add the following line, replacing `<user>` with the user that will run the script.
 
 ```
 # Allow the <user> user to reload nginx without a password
@@ -138,7 +150,7 @@ The `main.py` script needs passwordless `sudo` permission to reload Nginx. Run `
 
 ### 7. Initial Run
 
-On the first run, `main.py` will create `log_monitor_config.json`. You should **edit this file** to provide more specific context for each of your sites in the `system_prompt_context` field. This will greatly improve the LLM's accuracy.
+On the first run, `ban.py` will create `log_monitor_config.json`. You should **edit this file** to provide more specific context for each of your sites in the `system_prompt_context` field. This will greatly improve the LLM's accuracy.
 
 ```json log_monitor_config.json
 {
@@ -154,27 +166,34 @@ On the first run, `main.py` will create `log_monitor_config.json`. You should **
 
 ## Running the System
 
-Both `main.py` and `review.py` are long-running daemons. It is highly recommended to run them as services using `systemd` or `supervisor`.
+The system is designed to run as a single process that manages multiple threads. It is highly recommended to run it as a service using `systemd` or `supervisor`.
 
 For manual execution:
 
-**Terminal 1: Run the Log Monitor**
 ```bash
-python3 main.py
-```
+# Using uv (recommended)
+uv run start.py
 
-**Terminal 2: Run the Ban Reviewer**
-```bash
-python3 review.py
+# Or using standard python
+python3 start.py
 ```
 
 ## Usage
 
-### Manual Unbanning
+### Telegram Bot Commands
 
-To unban one or more IPs, simply add them to `/tmp/nginx-unban-ips.txt`, one per line. The `main.py` script will detect the change, remove the IPs from the database, regenerate `blacklist.conf`, and reload Nginx. The file will be cleared after processing.
+The system includes an interactive Telegram bot for management:
+
+- `/unban <ip1>,<ip2>`: Queues one or more IPs for unbanning.
+- `/memory add <server_name|all> <content>`: Adds a persistent memory/rule for the LLM to consider when reviewing logs for a specific server (or all servers).
+- `/memory list`: Lists all stored memories.
+- `/memory delete <id>`: Deletes a memory by its ID.
+- `/memory replace <id> <new_content>`: Updates an existing memory.
+
+### Manual Unbanning (File-based)
+
+To unban one or more IPs via file, simply add them to the `UNBAN_FILE` (default `/tmp/nginx-unban-ips.txt`), one per line. The `ban.py` script will detect the change, remove the IPs from the database, regenerate `blacklist.conf`, and reload Nginx. The file will be cleared after processing.
 
 ```bash
 echo "198.51.100.10" > /tmp/nginx-unban-ips.txt
-echo "203.0.113.25" >> /tmp/nginx-unban-ips.txt
 ```
