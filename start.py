@@ -3,6 +3,7 @@ import logging
 import threading
 import asyncio
 import sqlite3
+import re
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
@@ -86,10 +87,71 @@ class SharedBot:
             ips = "".join(context.args).split(',')
             try:
                 with open(UNBAN_FILE, 'a') as f:
-                    for ip in ips: f.write(f"{ip.strip()}\n")
+                    for ip in ips:
+                        if ip.strip():
+                            f.write(f"{ip.strip()}\n")
                 await update.message.reply_text(f"Queued unban for {len(ips)} IPs.", message_thread_id=TOPIC_ID_BANS_REVIEWS)
             except Exception as e:
                 await update.message.reply_text(f"Error: {e}", message_thread_id=TOPIC_ID_BANS_REVIEWS)
+
+        async def logs_cmd(update, context):
+            if str(update.effective_chat.id) != self.group_id: return
+            message = update.effective_message
+            if not message.reply_to_message:
+                await message.reply_text("Please reply to a ban record to fetch logs.")
+                return
+
+            original_text = message.reply_to_message.text or ""
+            # Extract IP (v4 or v6)
+            ip_match = re.search(r'(\d{1,3}(?:\.\d{1,3}){3}|[a-fA-F0-9:]+:[a-fA-F0-9:]+)', original_text)
+            if not ip_match:
+                await message.reply_text("Could not find an IP address in the quoted message.")
+                return
+
+            ip = ip_match.group(1)
+            await message.reply_text(f"Fetching logs for {ip}...")
+
+            try:
+                # Use the existing logic from BanReviewer to get logs
+                logs = self.ban_reviewer._get_full_logs_for_ip(ip)
+                lines = logs.splitlines()
+                
+                if len(lines) <= 50:
+                    response = logs if logs else "No logs found."
+                else:
+                    first_25 = lines[:25]
+                    last_25 = lines[-25:]
+                    skipped = len(lines) - 50
+                    response = "\n".join(first_25) + f"\n\n... [{skipped} lines skipped] ...\n\n" + "\n".join(last_25)
+                
+                # Telegram has a 4096 char limit, truncate if necessary
+                if len(response) > 4000:
+                    response = response[:4000] + "... (truncated)"
+                
+                await message.reply_text(f"Logs for {ip}:\n\n{response}")
+            except Exception as e:
+                await message.reply_text(f"Error fetching logs: {e}")
+
+        async def reply_unban_cmd(update, context):
+            if str(update.effective_chat.id) != self.group_id: return
+            message = update.effective_message
+            if not message.reply_to_message:
+                await message.reply_text("Please reply to a ban record to unban.")
+                return
+
+            original_text = message.reply_to_message.text or ""
+            ip_match = re.search(r'(\d{1,3}(?:\.\d{1,3}){3}|[a-fA-F0-9:]+:[a-fA-F0-9:]+)', original_text)
+            if not ip_match:
+                await message.reply_text("Could not find an IP address in the quoted message.")
+                return
+
+            ip = ip_match.group(1)
+            try:
+                with open(UNBAN_FILE, 'a') as f:
+                    f.write(f"{ip}\n")
+                await message.reply_text(f"Queued unban for {ip}.")
+            except Exception as e:
+                await message.reply_text(f"Error: {e}")
 
         async def handle_reply(update, context):
             message = update.effective_message
@@ -110,6 +172,9 @@ class SharedBot:
 
         app.add_handler(CommandHandler("memory", memory_cmd))
         app.add_handler(CommandHandler("unban", unban_cmd))
+        app.add_handler(CommandHandler("logs", logs_cmd))
+        app.add_handler(MessageHandler(filters.REPLY & filters.Regex(r'^/unban'), reply_unban_cmd))
+        app.add_handler(MessageHandler(filters.REPLY & filters.Regex(r'^/logs'), logs_cmd))
         app.add_handler(MessageHandler(filters.REPLY & ~filters.COMMAND, handle_reply))
         
         logging.info("Shared Telegram bot starting...")
