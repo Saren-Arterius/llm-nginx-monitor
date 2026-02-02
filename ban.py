@@ -7,8 +7,9 @@ import subprocess
 import re
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 # Load environment variables
 load_dotenv()
@@ -60,7 +61,7 @@ class LogMonitor:
         ipaddress.ip_network('100.64.0.0/10'),
         ipaddress.ip_network('127.0.0.0/8'),
     ]
-    FLOOD_THRESHOLD_BYTES = 10 * 1024  # 10 KB
+    FLOOD_THRESHOLD_BYTES = 100 * 1024  # 10 KB
 
     def __init__(self, log_dir_glob, config_file, nginx_deny_list, unban_file, db_conn=None):
         """Initializes the log monitor, sets up configuration, database, and watches."""
@@ -83,8 +84,8 @@ class LogMonitor:
         self.last_hourly_export_time = time.time()
         self.ip_regex = re.compile(r'^(\S+)')
         self.active_blacklist = set()  # New set to store active blacklisted IPs
-        self.loop = asyncio.new_event_loop()
         self.db_conn = db_conn
+        self.batch_queue = asyncio.Queue()
 
         # Run setup methods
         self._setup_monitoring()
@@ -353,13 +354,38 @@ class LogMonitor:
             prompt_parts.extend(lines)
         return "\n".join(prompt_parts)
 
-    def _query_llm(self, log_content: str) -> list | None:
+    async def _query_llm(self, log_content: str) -> list | None:
         """Sends log content to the LLM and gets a structured JSON response."""
         if not API_KEY or "<" in API_KEY:
             logging.error("OpenRouter API key is not set. Please set the OPENROUTER_API_KEY environment variable.")
             return None
 
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+        # Parse unique IPs from log_content
+        unique_ips = set()
+        for line in log_content.splitlines():
+            match = self.ip_regex.match(line)
+            if match:
+                unique_ips.add(match.group(1))
+
+        # Fetch previous records for these IPs
+        previous_records = []
+        if unique_ips:
+            try:
+                with self._get_db_conn() as conn:
+                    cursor = conn.cursor()
+                    placeholders = ','.join('?' for _ in unique_ips)
+                    # Omit 'logs' field as requested
+                    cursor.execute(
+                        f"SELECT ip, reason_tldr, confidence, timestamp, sections, ban_hours, verdict FROM blacklist WHERE ip IN ({placeholders}) AND ban_hours = 0",
+                        list(unique_ips)
+                    )
+                    columns = [column[0] for column in cursor.description]
+                    for row in cursor.fetchall():
+                        previous_records.append(dict(zip(columns, row)))
+            except sqlite3.Error as e:
+                logging.error(f"Failed to fetch history for IPs: {e}")
+
+        client = AsyncOpenAI(base_url=API_BASE_URL, api_key=API_KEY)
         system_prompt = (
             "You are a server network security expert. You will be provided snippet of nginx HTTP log for a public server that accessible by internet, including bots.\n"
             "Give the list of IPs that should be blacklisted for a very long time for blatant vulnerability scanning/triggering in attempt to hack.\n"
@@ -373,18 +399,29 @@ class LogMonitor:
             "If no suspicious IPs, return empty array [], and no need extra reasoning."
         )
 
+        messages = [{"role": "system", "content": system_prompt}]
+        if previous_records:
+            messages.append({"role": "developer", "content": json.dumps(previous_records)})
+        messages.append({"role": "user", "content": log_content})
+
+        print('=========================')
+        print(messages)
+        print('=========================')
+
         try:
             logging.info("Querying LLM with new log batch of %d characters.", len(log_content))
-            completion = client.chat.completions.create(
+            completion = await client.chat.completions.create(
                 model=LLM_MODEL,
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": log_content}],
-                temperature=0.6
+                messages=messages,
+                temperature=0.1
             )
             response_content = completion.choices[0].message.content
             response_content = response_content.strip().strip('```').strip('json').strip()
             data = json.loads(response_content)
             if isinstance(data, list):
-                logging.info(f"LLM identified {len(data)} IPs to blacklist.")
+                before_filter = len(data)
+                data = list(filter(lambda d: d['ip'] in unique_ips, data))
+                logging.info(f"LLM identified {len(data)} IPs to blacklist. Before Filter: {before_filter} IPs")
                 return data
             else:
                 logging.warning(f"LLM response was valid JSON but not a list: {type(data)}")
@@ -395,7 +432,7 @@ class LogMonitor:
         except Exception as e:
             if "429" in str(e):
                 logging.warning(f"LLM rate limit (429) hit. Sleeping for 60 seconds.")
-                time.sleep(60)
+                await asyncio.sleep(60)
             else:
                 logging.error(f"An unexpected error occurred while querying LLM: {e}")
             return None
@@ -419,6 +456,11 @@ class LogMonitor:
                     ip = item.get("ip")
                     if not ip or not isinstance(ip, str) or self._is_private_ip(ip):
                         logging.info(f"Skipping invalid or private IP from LLM: {ip}")
+                        continue
+
+                    # print(ip, self.active_blacklist)
+                    if ip in self.active_blacklist:
+                        logging.info(f"Skipping already blacklisted IP: {ip}")
                         continue
 
                     ip_evidence = logs_by_ip.get(ip)
@@ -466,7 +508,7 @@ class LogMonitor:
                 for ip in ips_to_unban:
                     try:
                         ipaddress.ip_address(ip)
-                        cursor.execute("DELETE FROM blacklist WHERE ip = ?", (ip,))
+                        cursor.execute("UPDATE blacklist SET ban_hours = 0 WHERE ip = ?", (ip,))
                         if cursor.rowcount > 0:
                             changes_made += 1
                             self.active_blacklist.discard(ip)
@@ -541,7 +583,7 @@ class LogMonitor:
         try:
             with self._get_db_conn() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT ip, reason_tldr, timestamp, ban_hours FROM blacklist WHERE confidence >= 0.5 ORDER BY timestamp DESC")
+                cursor.execute("SELECT ip, reason_tldr, timestamp, ban_hours FROM blacklist WHERE confidence >= 0.5 AND (ban_hours IS NULL OR ban_hours != 0) ORDER BY timestamp DESC")
                 all_potential_bans = cursor.fetchall()
         except sqlite3.Error as e:
             logging.error(f"Failed to read from database for Nginx export: {e}")
@@ -708,70 +750,75 @@ class LogMonitor:
 
         return True
 
-    def _process_log_batch(self) -> bool:
-        """Processes a log batch, queries LLM, and updates state."""
-        logging.info(f"Processing batch of {min(len(self.log_queue), MAX_QUEUE_SIZE)} logs.")
-        batch = [self.log_queue.popleft() for _ in range(min(len(self.log_queue), MAX_QUEUE_SIZE))]
+    async def _process_single_batch(self, batch):
+        """Processes a single batch of logs asynchronously."""
         logs_by_ip = defaultdict(lambda: {'logs': [], 'sections': set()})
+        filtered_batch_for_llm = []
 
+        # Re-check active_blacklist here because it might have been updated 
+        # by another parallel batch worker task.
         for filepath, line in batch:
             match = self.ip_regex.match(line)
             if match:
                 ip = match.group(1)
-                # Double-check against active_blacklist before sending to LLM,
-                # though _poll_log_files should largely handle this
                 if ip not in self.active_blacklist:
                     server_name = self.config["files"].get(filepath, {}).get("server_name", "unknown")
                     logs_by_ip[ip]['logs'].append(line)
                     logs_by_ip[ip]['sections'].add(server_name)
-
-        # Only send logs for IPs not already blacklisted
-        filtered_batch_for_llm = []
-        for file_path, log_line in batch:
-            match = self.ip_regex.match(log_line)
-            if match and match.group(1) not in self.active_blacklist:
-                filtered_batch_for_llm.append((file_path, log_line))
+                    filtered_batch_for_llm.append((filepath, line))
 
         if not filtered_batch_for_llm:
-            logging.info("Batch contained only already blacklisted IPs or no eligible IPs. Skipping LLM query.")
-            # Still update cursors for processed lines
-            for path, new_pos in self.pending_cursor_updates.items():
-                if path in self.config["files"]:
-                    self.config["files"][path]["cursor"] = new_pos
-            with open(self.CONFIG_FILE, 'w') as f:
-                json.dump(self.config, f, indent=4)
-            self.pending_cursor_updates.clear()
-            return True
-
+            logging.info("Batch empty after filtering already blacklisted IPs.")
+            return True, [], logs_by_ip
 
         llm_prompt = self._format_logs_for_llm(filtered_batch_for_llm)
-        print('=============================\n' + llm_prompt + '\n=============================')
-        blacklisted_items = self._query_llm(llm_prompt)
-        self._update_current_public_ip()
-
+        blacklisted_items = await self._query_llm(llm_prompt)
+        
         if blacklisted_items is not None:
-            db_updated = self._update_database(blacklisted_items, logs_by_ip)
-            if db_updated:
-                self._check_and_update_deny_list()
-
-            for path, new_pos in self.pending_cursor_updates.items():
-                if path in self.config["files"]:
-                    self.config["files"][path]["cursor"] = new_pos
-            with open(self.CONFIG_FILE, 'w') as f:
-                json.dump(self.config, f, indent=4)
-            self.pending_cursor_updates.clear()
-            logging.info("Successfully processed batch and updated cursors.")
-            return True
+            return True, blacklisted_items, logs_by_ip
         else:
-            logging.warning("LLM query failed. Re-queuing batch.")
-            self.log_queue.extendleft(reversed(batch))
-            return False
+            return False, batch, logs_by_ip
 
-    def run(self):
+    async def _process_batch_and_update(self, batch):
+        """Helper for worker to process a batch and update DB/Nginx."""
+        try:
+            logging.info(f"Processing batch of {len(batch)} logs.")
+            success, result, logs_by_ip = await self._process_single_batch(batch)
+
+            if success:
+                if result:
+                    db_updated = self._update_database(result, logs_by_ip)
+                    if db_updated:
+                        self._check_and_update_deny_list()
+                logging.info("Batch processed successfully.")
+            else:
+                logging.warning("Batch processing failed. Re-queuing logs.")
+                # Re-queue individual logs to avoid infinite loop on a single bad batch
+                for item in batch:
+                    self.log_queue.append(item)
+        except Exception as e:
+            logging.error(f"Error processing batch: {e}", exc_info=True)
+
+    async def _batch_worker(self):
+        """Worker that processes log batches from the queue in parallel."""
+        logging.info("Batch worker started.")
+        while True:
+            batch = await self.batch_queue.get()
+            # Fire and forget the batch processing to allow parallel LLM requests
+            asyncio.create_task(self._process_batch_and_update(batch))
+            self.batch_queue.task_done()
+
+    async def run(self):
         """The main monitoring loop."""
+        # Start the batch worker
+        worker_task = asyncio.create_task(self._batch_worker())
+        
         try:
             while True:
-                events = self.inotify.read(timeout=POLLING_INTERVAL_SECONDS * 1000)
+                # Use run_in_executor for blocking inotify read
+                events = await asyncio.get_event_loop().run_in_executor(
+                    None, self.inotify.read, POLLING_INTERVAL_SECONDS * 1000
+                )
                 self._handle_inotify_events(events)
                 had_new_logs = self._poll_log_files()
 
@@ -780,16 +827,35 @@ class LogMonitor:
                 timeout_reached = (self.log_queue or had_new_logs) and time_since_check >= MAX_WAIT_SECONDS
 
                 if self.log_queue and (queue_full or timeout_reached):
-                    if self._process_log_batch():
-                        self.last_llm_check_time = time.time()
+                    # Move logs from log_queue to batch_queue
+                    batch = []
+                    while self.log_queue and len(batch) < MAX_QUEUE_SIZE:
+                        batch.append(self.log_queue.popleft())
+                    
+                    await self.batch_queue.put(batch)
+                    self.last_llm_check_time = time.time()
+                    
+                    # Update cursors and config periodically
+                    if self.pending_cursor_updates:
+                        for path, new_pos in self.pending_cursor_updates.items():
+                            if path in self.config["files"]:
+                                self.config["files"][path]["cursor"] = new_pos
+                        with open(self.CONFIG_FILE, 'w') as f:
+                            json.dump(self.config, f, indent=4)
+                        self.pending_cursor_updates.clear()
 
                 if time.time() - self.last_hourly_export_time >= 3600:
                     logging.info("Performing scheduled 1-hour deny list export and check.")
-                    self._check_and_update_deny_list() # This will refresh self.active_blacklist
+                    self._check_and_update_deny_list()
                     self.last_hourly_export_time = time.time()
-        except KeyboardInterrupt:
-            logging.info("Shutdown requested.")
+                
+                await asyncio.sleep(0.1) # Yield to other tasks
+        except asyncio.CancelledError:
+            logging.info("Monitor task cancelled.")
+        except Exception as e:
+            logging.error(f"Error in main loop: {e}", exc_info=True)
         finally:
+            worker_task.cancel()
             self.close()
 
     def set_telegram_callback(self, callback):

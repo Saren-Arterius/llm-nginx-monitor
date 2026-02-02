@@ -4,11 +4,12 @@ import json
 import time
 import sqlite3
 from collections import defaultdict
+import asyncio
 import subprocess
 import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 # Load environment variables
 load_dotenv()
@@ -38,7 +39,7 @@ class BanReviewer:
         """Initializes the BanReviewer instance."""
         self._setup_logging()
         self._validate_api_key()
-        self.client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+        self.client = AsyncOpenAI(base_url=API_BASE_URL, api_key=API_KEY)
         self.db_conn = db_conn
         self.monitor_config = self._load_monitor_config()
         self.last_summary_time = 0
@@ -217,7 +218,7 @@ class BanReviewer:
 
         return "\n".join(contexts)
 
-    def _ask_llm_for_review(self, review_data: dict) -> dict | None:
+    async def _ask_llm_for_review(self, review_data: dict) -> dict | None:
         """Sends all collected data to an LLM for a final verdict."""
         system_prompt = """
 You are a senior cybersecurity analyst. Your task is to review an automated ban recommendation and act as a final gatekeeper to prevent false positives and determine an appropriate ban duration. Your decisions should be consistent.
@@ -269,7 +270,7 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
 
         try:
             logging.info(f"Requesting review for IP: {review_data.get('ip_to_review')}")
-            completion = self.client.chat.completions.create(
+            completion = await self.client.chat.completions.create(
                 model=LLM_REVIEW_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -415,7 +416,7 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
             logging.error(f"Failed to store summary in database: {e}")
             self.db_conn.rollback()
 
-    def _ask_llm_for_summary(self, incidents: list, previous_summaries: list, timeframe: str) -> str | None:
+    async def _ask_llm_for_summary(self, incidents: list, previous_summaries: list, timeframe: str) -> str | None:
         """Generates a narrative summary of notable incidents using the LLM in Traditional Chinese."""
         system_prompt = """
 您是一位資深網路安全分析師AI。您的任務是為團隊撰寫一份關於重大安全事件的敘述性摘要。
@@ -444,7 +445,7 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
 """
         logging.info("Requesting narrative summary for notable incidents from LLM.")
         try:
-            completion = self.client.chat.completions.create(
+            completion = await self.client.chat.completions.create(
                 model=LLM_REVIEW_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -485,7 +486,7 @@ Based on your expert review, provide a decision in a strict JSON format. Your en
             logging.error(f"Failed to fetch incidents for summary at ts {summary_ts}: {e}")
             return None
 
-    def _ask_llm_for_telegram_reply(self, original_message: str, user_reply: str, incidents_json: str | None) -> str | None:
+    async def _ask_llm_for_telegram_reply(self, original_message: str, user_reply: str, incidents_json: str | None) -> str | None:
         """Asks the LLM to formulate a response to a user's reply on Telegram."""
         system_prompt = """
 You are a helpful cybersecurity analyst assistant AI. A user has replied to one of your monitoring summaries on Telegram. Your task is to provide a concise and helpful answer based on the context of the original summary, the user's query, and the raw incident data.
@@ -527,7 +528,7 @@ Based on the above, please provide a helpful response to the user.
 """
         logging.info(f"Requesting LLM response for Telegram reply.")
         try:
-            completion = self.client.chat.completions.create(
+            completion = await self.client.chat.completions.create(
                 model=LLM_REVIEW_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -541,7 +542,7 @@ Based on the above, please provide a helpful response to the user.
             logging.error(f"An unexpected error occurred during LLM reply generation: {e}")
             return "抱歉，我在處理您的請求時遇到錯誤。"
 
-    def _run_summary_task(self):
+    async def _run_summary_task(self):
         """Orchestrates the creation and sending of the daily summary."""
         logging.info("Starting summary task.")
         summary_data = self._fetch_data_for_summary()
@@ -574,7 +575,7 @@ Based on the above, please provide a helpful response to the user.
 
         if summary_data["incidents"]:
             incidents_json = json.dumps(summary_data["incidents"], ensure_ascii=False)
-            narrative_part = self._ask_llm_for_summary(summary_data["incidents"], previous_summaries, time_frame_str)
+            narrative_part = await self._ask_llm_for_summary(summary_data["incidents"], previous_summaries, time_frame_str)
             if narrative_part:
                 llm_narrative = "\n\n入侵事件與分析:\n" + narrative_part
                 self._store_summary(narrative_part, incidents_json)
@@ -591,7 +592,37 @@ Based on the above, please provide a helpful response to the user.
         print('*************************')
         self._send_telegram_message(full_summary, topic_id=TOPIC_ID_SUMMARIES)
 
-    def run(self):
+    async def _process_single_review(self, entry, recent_verdicts):
+        """Processes a single IP review asynchronously."""
+        ip, reason, confidence, logs, sections = entry
+        review_data = {
+            "ip_to_review": ip,
+            "initial_reason": reason,
+            "initial_confidence": confidence,
+            "affected_sections": sections,
+            "triggering_logs": logs,
+            "server_context": self._get_context_from_sections(sections),
+            "historical_logs": await asyncio.to_thread(self._get_full_logs_for_ip, ip),
+            "recent_verdicts": recent_verdicts,
+        }
+        verdict_result = await self._ask_llm_for_review(review_data)
+        
+        if verdict_result:
+            ban_hours = verdict_result.get("ban_hours")
+            verdict_text = verdict_result.get("verdict")
+            self._update_db_with_verdict(ip, ban_hours, verdict_text)
+            self._process_amendments(ip, verdict_result)
+
+            # Send message for every review
+            prefix = "[Review]" if ban_hours != -1 else "[Ban]"
+            server_tag = f" [{sections}]" if sections else ""
+            msg = f"{prefix}{server_tag} {ip}\nBan Hours: {ban_hours}\nVerdict: {verdict_text}"
+            self._send_telegram_message(msg, topic_id=TOPIC_ID_BANS_REVIEWS)
+        else:
+            logging.warning(f"Review for IP {ip} failed. Marking to prevent retry loop.")
+            self._update_db_with_verdict(ip, -2, "Review failed due to API or parsing error.")
+
+    async def run(self):
         """Main loop to periodically check for reviews and generate summaries."""
         logging.info("Starting Ban Reviewer process.")
 
@@ -599,13 +630,13 @@ Based on the above, please provide a helpful response to the user.
             raise RuntimeError("Database connection not initialized. BanReviewer must be provided with a db_conn.")
 
         self._initialize_db_schema()
-        self._run_summary_task()
+        await self._run_summary_task()
         self.last_summary_time = time.time()
 
         try:
             while True:
                 if time.time() - self.last_summary_time >= SUMMARY_INTERVAL_SECONDS:
-                    self._run_summary_task()
+                    await self._run_summary_task()
                     self.last_summary_time = time.time()
 
                 try:
@@ -616,44 +647,21 @@ Based on the above, please provide a helpful response to the user.
                         logging.info(f"Found {len(unreviewed_entries)} new entries to review.")
                         recent_verdicts = self._fetch_recent_verdicts()
 
-                        for entry in unreviewed_entries:
-                            ip, reason, confidence, logs, sections = entry
-                            review_data = {
-                                "ip_to_review": ip,
-                                "initial_reason": reason,
-                                "initial_confidence": confidence,
-                                "affected_sections": sections,
-                                "triggering_logs": logs,
-                                "server_context": self._get_context_from_sections(sections),
-                                "historical_logs": self._get_full_logs_for_ip(ip),
-                                "recent_verdicts": recent_verdicts,
-                            }
-                            verdict_result = self._ask_llm_for_review(review_data)
-
-                            if verdict_result:
-                                ban_hours = verdict_result.get("ban_hours")
-                                verdict_text = verdict_result.get("verdict")
-                                self._update_db_with_verdict(ip, ban_hours, verdict_text)
-                                self._process_amendments(ip, verdict_result)
-
-                                # Send message for every review
-                                prefix = "[Review]" if ban_hours != -1 else "[Ban]"
-                                server_tag = f" [{sections}]" if sections else ""
-                                msg = f"{prefix}{server_tag} {ip}\nBan Hours: {ban_hours}\nVerdict: {verdict_text}"
-                                self._send_telegram_message(msg, topic_id=TOPIC_ID_BANS_REVIEWS)
-                            else:
-                                logging.warning(f"Review for IP {ip} failed. Marking to prevent retry loop.")
-                                self._update_db_with_verdict(ip, -2, "Review failed due to API or parsing error.")
+                        # Process all reviews in parallel
+                        tasks = [self._process_single_review(entry, recent_verdicts) for entry in unreviewed_entries]
+                        await asyncio.gather(*tasks)
                         logging.info("Review cycle complete.")
 
                 except sqlite3.Error as e:
                     logging.critical(f"Database error during review cycle: {e}")
                 except Exception as e:
                     logging.critical(f"An unexpected error occurred during review cycle: {e}", exc_info=True)
-                finally:
-                    time.sleep(REVIEW_INTERVAL_SECONDS)
-        except KeyboardInterrupt:
-            logging.info("Shutdown requested by user.")
+                
+                await asyncio.sleep(REVIEW_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            logging.info("Ban Reviewer task cancelled.")
+        except Exception as e:
+            logging.error(f"Error in Ban Reviewer main loop: {e}", exc_info=True)
         finally:
             logging.info("Ban Reviewer stopped.")
 

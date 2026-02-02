@@ -33,22 +33,18 @@ class SharedBot:
         self.group_id = group_id
         self.log_monitor = log_monitor
         self.ban_reviewer = ban_reviewer
-        self.loop = asyncio.new_event_loop()
         self.bot = Bot(token=token)
 
-    def send_message_sync(self, text, topic_id=None, reply_to_message_id=None):
-        """Synchronous wrapper to send a telegram message."""
-        async def send():
-            await self.bot.send_message(
-                chat_id=self.group_id,
-                text=text,
-                message_thread_id=topic_id,
-                reply_to_message_id=reply_to_message_id
-            )
-        asyncio.run_coroutine_threadsafe(send(), self.loop)
+    async def send_message(self, text, topic_id=None, reply_to_message_id=None):
+        """Asynchronous method to send a telegram message."""
+        await self.bot.send_message(
+            chat_id=self.group_id,
+            text=text,
+            message_thread_id=topic_id,
+            reply_to_message_id=reply_to_message_id
+        )
 
     def run(self):
-        asyncio.set_event_loop(self.loop)
         app = ApplicationBuilder().token(self.token).build()
 
         async def memory_cmd(update, context):
@@ -166,7 +162,7 @@ class SharedBot:
             if original_text and user_reply:
                 logging.info(f"Received Telegram reply to process: '{user_reply[:50]}...'")
                 incidents_json = self.ban_reviewer._fetch_incidents_for_summary_by_timestamp(original_ts)
-                llm_response = self.ban_reviewer._ask_llm_for_telegram_reply(original_text, user_reply, incidents_json)
+                llm_response = await self.ban_reviewer._ask_llm_for_telegram_reply(original_text, user_reply, incidents_json)
                 if llm_response:
                     await message.reply_text(llm_response)
 
@@ -187,9 +183,9 @@ class SharedBot:
             )
 
         app.post_init = post_init
-        app.run_polling(stop_signals=None)
+        return app
 
-def ban():
+async def main():
     # Shared database connection
     db_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 
@@ -207,26 +203,36 @@ def ban():
     # Initialize shared bot
     shared_bot = SharedBot(TELEGRAM_BOT_TOKEN, TELEGRAM_GROUP_ID, monitor, reviewer)
     
-    # Set callbacks
-    monitor.set_telegram_callback(shared_bot.send_message_sync)
-    reviewer.set_telegram_callback(shared_bot.send_message_sync)
+    # Set callbacks (now using async send_message)
+    def telegram_callback(text, topic_id=None):
+        asyncio.create_task(shared_bot.send_message(text, topic_id))
     
-    # Start threads
-    monitor_thread = threading.Thread(target=monitor.run, daemon=True)
-    reviewer_thread = threading.Thread(target=reviewer.run, daemon=True)
-    bot_thread = threading.Thread(target=shared_bot.run, daemon=True)
+    monitor.set_telegram_callback(telegram_callback)
+    reviewer.set_telegram_callback(telegram_callback)
     
-    monitor_thread.start()
-    reviewer_thread.start()
-    bot_thread.start()
+    # Initialize Telegram App
+    app = shared_bot.run()
     
-    logging.info("All components started. Press Ctrl+C to stop.")
+    logging.info("All components starting in async loop...")
     
+    # Run everything together
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        
+        await asyncio.gather(
+            monitor.run(),
+            reviewer.run(),
+        )
+        
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+def ban():
     try:
-        while True:
-            monitor_thread.join(1)
-            reviewer_thread.join(1)
-            bot_thread.join(1)
+        asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("Shutdown requested.")
 
